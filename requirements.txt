@@ -1,0 +1,14 @@
+numpy
+torch
+torchvision
+torchsummary
+tensorboardX
+pillow
+xarm-python-sdk
+pyrealsense2
+matplotlib
+scipy
+scikit-image
+opencv-python
+segment-anything
+bresenham
