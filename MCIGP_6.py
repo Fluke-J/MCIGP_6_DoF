@@ -57,7 +57,7 @@ def parse_args():
                         help='TCP pre-grasp retreat distance in millimeters')
     parser.add_argument('--lift-mm', type=float, default=80.0,
                         help='TCP lift distance in millimeters after closing the gripper')
-    parser.add_argument('--travel-z-mm', type=float, default=320.0,
+    parser.add_argument('--travel-z-mm', type=float, default=400.0,
                         help='Safe world-Z height for travel after lifting away from the object')
     parser.add_argument('--tcp-speed', type=float, default=80.0,
                         help='Absolute Cartesian motion speed for 6DoF grasp moves')
@@ -71,21 +71,21 @@ def parse_args():
                         help='Extra TCP alignment rotation around Z in degrees')
     parser.add_argument('--offset-x-mm', type=float, default=17.0,
                         help='Base-frame X correction from quick_click calibration')
-    parser.add_argument('--offset-y-mm', type=float, default=0.0,
+    parser.add_argument('--offset-y-mm', type=float, default=15.0,
                         help='Base-frame Y correction from quick_click calibration')
     parser.add_argument('--offset-z-mm', type=float, default=70.0,
                         help='Base-frame Z correction from quick_click calibration')
-    parser.add_argument('--min-grasp-z-mm', type=float, default=220.0,
+    parser.add_argument('--min-grasp-z-mm', type=float, default=190.0,
                         help='Do not command grasp targets below this base-frame Z height')
-    parser.add_argument('--min-tcp-yaw-deg', type=float, default=-70.0,
+    parser.add_argument('--min-tcp-yaw-deg', type=float, default=-90.0,
                         help='Minimum allowed TCP yaw in degrees to avoid cable winding')
-    parser.add_argument('--max-tcp-yaw-deg', type=float, default=70.0,
+    parser.add_argument('--max-tcp-yaw-deg', type=float, default=90.0,
                         help='Maximum allowed TCP yaw in degrees to avoid cable winding')
     parser.add_argument('--use-normal-orientation', action='store_true',
                         help='Use small surface-normal-derived roll/pitch adjustments instead of fixed orientation')
-    parser.add_argument('--max-roll-tilt-deg', type=float, default=20.0,
+    parser.add_argument('--max-roll-tilt-deg', type=float, default=10.0,
                         help='Maximum allowed roll deviation from the home grasp orientation')
-    parser.add_argument('--max-pitch-tilt-deg', type=float, default=20.0,
+    parser.add_argument('--max-pitch-tilt-deg', type=float, default=10.0,
                         help='Maximum allowed pitch deviation from the home grasp orientation')
     parser.add_argument('--max-yaw-delta-deg', type=float, default=95.0,
                         help='Maximum allowed yaw deviation from the home grasp orientation')
@@ -94,8 +94,18 @@ def parse_args():
     parser.set_defaults(safe_yaw_only_fallback=True)
     parser.add_argument('--dry-run', action='store_true',
                         help='Compute the grasp pose without moving the robot')
-    parser.add_argument('--normal-alpha', type=float, default=0.2,
+    parser.add_argument('--normal-alpha', type=float, default=0.5,
                         help='Blend factor between top-down (0) and surface normal (1)')
+    parser.add_argument('--mva-gain', type=float, default=0.7,
+                        help='Scale factor for MVA XY correction')
+    parser.add_argument('--mva-max-step-mm', type=float, default=80.0,
+                        help='Maximum XY distance for one MVA correction')
+    parser.add_argument('--mva-deadband-mm', type=float, default=5.0,
+                        help='Skip MVA correction when XY error is below this distance')
+    parser.add_argument('--mva-speed', type=float, default=60.0,
+                        help='Cartesian speed for MVA correction')
+    parser.add_argument('--mva-acc', type=float, default=200.0,
+                        help='Cartesian acceleration for MVA correction')
 
     args = parser.parse_args()
     return args
@@ -118,7 +128,7 @@ def resolve_local_path(path):
     )
 
 
-def get_H_eef_cam(path='cam2eef.npz', invert_hand_eye=True):
+def get_H_eef_cam(path='cam2eef.npz', invert_hand_eye=False):
     cam2eff = np.load(resolve_local_path(path))
     R = cam2eff['R']
     tvec = np.asarray(cam2eff['T'], dtype=np.float32).reshape(3)
@@ -421,6 +431,51 @@ def wait_until_pose(arm, pose_deg, tolerance=3.0):
             break
         time.sleep(0.1)
 
+
+def execute_mva_xy_move(arm, hand_eye_transform, point_cam_m, args, label='MVA'):
+    point_cam_m = np.asarray(point_cam_m, dtype=np.float32).reshape(3)
+    delta_cam_mm = np.array([point_cam_m[0], point_cam_m[1], 0.0], dtype=np.float32) * 1000.0
+
+    ret, current_pose = arm.get_position(is_radian=False)
+    if ret != 0:
+        print(f'[{label}] Cannot read robot pose; skip MVA')
+        return False
+
+    H_base_eef = pose_to_matrix(current_pose)
+    R_base_cam = H_base_eef[:3, :3] @ hand_eye_transform[:3, :3]
+    delta_base_mm = R_base_cam @ delta_cam_mm
+    delta_xy = np.asarray(delta_base_mm[:2], dtype=np.float32) * float(args.mva_gain)
+
+    step_norm = float(np.linalg.norm(delta_xy))
+    if step_norm < float(args.mva_deadband_mm):
+        print(f'[{label}] MVA shift inside deadband:', np.round(delta_xy, 2), 'mm')
+        return False
+
+    max_step = float(args.mva_max_step_mm)
+    if step_norm > max_step:
+        delta_xy *= max_step / step_norm
+
+    target_pose = np.asarray(current_pose, dtype=np.float32).copy()
+    target_pose[0] += float(delta_xy[0])
+    target_pose[1] += float(delta_xy[1])
+
+    print(f'[{label}] Camera point m:', np.round(point_cam_m, 4))
+    print(f'[{label}] Base XY correction mm:', np.round(delta_xy, 2))
+
+    if args.dry_run:
+        print(f'[{label}] Dry run: MVA move skipped')
+        return False
+
+    move_abs_pose(
+        arm,
+        target_pose,
+        speed=args.mva_speed,
+        mvacc=args.mva_acc,
+        wait=True,
+    )
+    wait_until_pose(arm, target_pose)
+    return True
+
 """
 def execute_grasp_6dof(arm, args, depth_img, color_intrinsics, pixel_xy, depth_m,
                        grasp_angle_rad, grasp_width, hand_eye_transform):
@@ -653,10 +708,13 @@ if __name__ == '__main__':
                                                                   depth=dis)
                         campos = [x, y, z]
 
-                        robot_pos = (campos[1], -campos[0])
-                        arm.set_tool_position(x=robot_pos[0] * 1000, y=robot_pos[1] * 1000, z=0,
-                                              roll=0, pitch=0, yaw=0, speed=200,
-                                              is_radian=False)
+                        execute_mva_xy_move(
+                            arm=arm,
+                            hand_eye_transform=hand_eye_transform,
+                            point_cam_m=campos,
+                            args=args,
+                            label='Global MVA',
+                        )
 
                         time.sleep(2)
 
@@ -684,12 +742,15 @@ if __name__ == '__main__':
                         campos = [x, y, z]
 
                         # move robot
-                        robot_pos = (campos[1], -campos[0])
-                        arm.set_tool_position(x=robot_pos[0] * 1000, y=robot_pos[1] * 1000, z=0,
-                                              roll=0, pitch=0, yaw=0, speed=200,
-                                              is_radian=False)
+                        execute_mva_xy_move(
+                            arm=arm,
+                            hand_eye_transform=hand_eye_transform,
+                            point_cam_m=campos,
+                            args=args,
+                            label='Local MVA',
+                        )
 
-                        time.sleep(2)
+                        time.sleep(0.2)
 
 # ----------------------------------------------------------------------------------------------------------------------------#
                                                        # ISGD part
@@ -1146,10 +1207,13 @@ if __name__ == '__main__':
                                                                           depth=dis)
                                 campos = [x, y, z]
 
-                                robot_pos = (campos[1], -campos[0])
-                                arm.set_tool_position(x=robot_pos[0] * 1000, y=robot_pos[1] * 1000, z=0,
-                                                      roll=0, pitch=0, yaw=0, speed=200,
-                                                      is_radian=False)
+                                execute_mva_xy_move(
+                                    arm=arm,
+                                    hand_eye_transform=hand_eye_transform,
+                                    point_cam_m=campos,
+                                    args=args,
+                                    label='Fallback MVA',
+                                )
                                 time.sleep(2)
 
     finally:
