@@ -540,8 +540,7 @@ def execute_grasp_6dof(arm, args, depth_img, color_intrinsics, pixel_xy, depth_m
 def execute_grasp_6dof(arm, args, depth_img, color_intrinsics, pixel_xy, depth_m,
                        grasp_angle_rad, grasp_width, hand_eye_transform):
 
-    # 🔥 disable unstable tilt for now
-    args.use_normal_orientation = False
+    args.use_normal_orientation = True
 
     try:
         result = compute_6dof_target_poses(
